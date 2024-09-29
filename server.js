@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 1234;
 
 
 app.use(cors({
-    origin: 'https://xangarsordermanage.netlify.app'
+    origin: 'https://xangars1.netlify.app'
   }));
 
 
@@ -19,9 +19,9 @@ app.use(bodyParser.json());
 // MySQL Database Connection
 const db = mysql.createConnection({
     host: 'us-cluster-east-01.k8s.cleardb.net',
-    user: 'b2d8a0a0f63451',         // Replace with your MySQL username
-    password: '07030726',  // Replace with your MySQL password
-    database: 'heroku_cbfcd4de2f6f350'
+    user: 'b11af232066e12',         // Replace with your MySQL username
+    password: 'd731a403',  // Replace with your MySQL password
+    database: 'heroku_cfe056d6c04716a'
 });
 
 db.connect((err) => {
