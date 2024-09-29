@@ -4,7 +4,9 @@ const bodyParser = require('body-parser');
 const mysql = require('mysql2');
 
 const app = express();
-const port = 1234;
+
+const PORT = process.env.PORT || 1234;
+
 
 app.use(cors({
     origin: 'https://xangarsordermanage.netlify.app'
@@ -164,6 +166,6 @@ app.post('/api/validate', (req, res) => {
 
 
 // Start the server
-app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });
