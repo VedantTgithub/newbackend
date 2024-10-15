@@ -1,109 +1,407 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const mysql = require('mysql2');
+const mysql = require('mysql2/promise');
+const bcrypt = require('bcrypt');
+const session = require('express-session');
 
 const app = express();
-
 const PORT = process.env.PORT || 1234;
 
-
+// Middleware
 app.use(cors({
-    origin: 'https://xangars1.netlify.app'
-  }));
-
-
-
+    origin: 'http://localhost:5173',
+    credentials: true
+}));
 app.use(bodyParser.json());
 
+// Session configuration
+app.use(session({
+    secret: 'a_really_long_random_string_with_symbols_!@#$%^&*',
+    resave: false,
+    saveUninitialized: false,
+    cookie: { secure: false, httpOnly: true, maxAge: 24 * 60 * 60 * 1000 }
+}));
+
 // MySQL Database Connection
-const db = mysql.createConnection({
-    host: 'us-cluster-east-01.k8s.cleardb.net',
-    user: 'b11af232066e12',         // Replace with your MySQL username
-    password: 'd731a403',  // Replace with your MySQL password
-    database: 'heroku_cfe056d6c04716a'
+const db = mysql.createPool({
+    host: 'localhost',
+    user: 'newuser',
+    password: 'Vedant@123',
+    database: 'xangarsfinal',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
 });
 
-db.connect((err) => {
-    if (err) {
-        console.error('Error connecting to MySQL:', err);
+// Middleware to check if user is authenticated and is a master user
+const isMaster = (req, res, next) => {
+    if (req.session && req.session.userRole === 'central-admin') {
+        next();
     } else {
-        console.log('Connected to MySQL');
+        res.status(401).json({ error: 'Unauthorized: Master access required' });
     }
-});
-
-// Helper function to check if the order number is unique
-const isOrderNoUnique = (orderNo) => {
-    return new Promise((resolve, reject) => {
-        const query = `SELECT COUNT(*) as count FROM orders WHERE order_no = ?`;
-        db.query(query, [orderNo], (err, results) => {
-            if (err) return reject(err);
-            const count = results[0].count;
-            resolve(count === 0); // true if no orders found
-        });
-    });
 };
 
+// API to handle distributor registration
+app.post('/api/register', async (req, res) => {
+    const { email, password, distributorName, country } = req.body;
 
-
-
-
-
-// API route to handle order submission with validation
-app.post('/api/orders', async (req, res) => {
-    const { distributorName, orderNo, totalQty, totalValue, products } = req.body;
-
-    // Validation: Ensure all fields are filled and products are not empty
-    if (!distributorName || !orderNo || !totalQty || !totalValue || !products || products.length === 0) {
-        return res.status(400).json({ error: 'All fields must be filled, and products cannot be empty.' });
+    if (!email || !password || !distributorName || !country) {
+        return res.status(400).json({ error: 'All fields are required' });
     }
 
     try {
-        // Check if order number is unique
-        const isUnique = await isOrderNoUnique(orderNo);
-        if (!isUnique) {
-            return res.status(400).json({ error: 'Order number already exists. It must be unique.' });
-        }
-
-        // Insert order into 'orders' table
-        const insertOrderQuery = `INSERT INTO orders (distributor_name, order_no, total_qty, total_value) VALUES (?, ?, ?, ?)`;
-        db.query(insertOrderQuery, [distributorName, orderNo, totalQty, totalValue], (err, result) => {
-            if (err) {
-                console.error('Error inserting order:', err);
-                return res.status(500).json({ error: 'Database error when inserting order.' });
-            }
-
-            const orderId = result.insertId;
-
-            // Insert products into 'products' table
-            const insertProductQuery = `INSERT INTO products (order_id, code, description, min_order_qty, price, quantity_ordered, total_value) VALUES ?`;
-            const productValues = products.map(product => [
-                orderId,
-                product.code,
-                product.description,
-                product.minOrderQty,
-                product.price,
-                product.quantityOrdered,
-                product.totalValue
-            ]);
-
-            db.query(insertProductQuery, [productValues], (err) => {
-                if (err) {
-                    console.error('Error inserting products:', err);
-                    return res.status(500).json({ error: 'Database error when inserting products.' });
-                }
-
-                res.status(200).json({ message: 'Order and products saved successfully' });
-            });
-        });
-
-    } catch (err) {
-        console.error('Error processing order:', err);
-        res.status(500).json({ error: 'Server error during order processing' });
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const insertQuery = `
+            INSERT INTO Distributor (DistributorName, Email, Password, CountryName)
+            VALUES (?, ?, ?, ?)
+        `;
+        const [result] = await db.query(insertQuery, [distributorName, email, hashedPassword, country]);
+        res.status(200).json({ message: 'Distributor registered successfully', distributorId: result.insertId });
+    } catch (error) {
+        console.error('Error during registration:', error);
+        res.status(500).json({ error: 'Error during registration' });
     }
 });
 
-// API route to get consolidated orders
+// API to handle login for both MasterList (central admin) and Distributor
+app.post('/api/login', async (req, res) => {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+        return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    try {
+        // First, check if it's a central admin (master)
+        const [masterResults] = await db.query('SELECT * FROM Master WHERE EmailID = ?', [email]);
+
+        if (masterResults.length > 0) {
+            const master = masterResults[0];
+            if (master.Password === password) {
+                req.session.userId = master.MasterID;
+                req.session.userRole = 'central-admin';
+                return res.status(200).json({
+                    message: 'Login successful',
+                    userRole: 'central-admin',
+                    adminId: master.MasterID,
+                    email: master.EmailID
+                });
+            }
+        }
+
+        // If not a central admin, check for distributor
+        const [distributorResults] = await db.query('SELECT * FROM Distributor WHERE Email = ?', [email]);
+
+        if (distributorResults.length > 0) {
+            const distributor = distributorResults[0];
+            const isDistributorPasswordMatch = await bcrypt.compare(password, distributor.Password);
+            if (isDistributorPasswordMatch) {
+                req.session.userId = distributor.DistributorID;
+                req.session.userRole = 'distributor';
+                req.session.distributorName = distributor.DistributorName;
+                req.session.countryName = distributor.CountryName;
+                return res.status(200).json({
+                    message: 'Login successful',
+                    userRole: 'distributor',
+                    distributorId: distributor.DistributorID,
+                    distributorName: distributor.DistributorName,
+                    email: distributor.Email,
+                    countryName: distributor.CountryName
+                });
+            }
+        }
+
+        // If no match found for either admin or distributor
+        return res.status(400).json({ error: 'Invalid email or password' });
+    } catch (error) {
+        console.error('Database error during login:', error);
+        return res.status(500).json({ error: 'Database error during login' });
+    }
+});
+
+// API to handle logout
+app.post('/api/logout', (req, res) => {
+    req.session.destroy((err) => {
+        if (err) {
+            return res.status(500).json({ error: 'Error logging out' });
+        }
+        res.clearCookie('connect.sid');
+        return res.status(200).json({ message: 'Logged out successfully' });
+    });
+});
+
+// API to get session info
+app.get('/api/session', (req, res) => {
+    if (req.session.userId) {
+        res.json({
+            isLoggedIn: true,
+            userId: req.session.userId,
+            userRole: req.session.userRole,
+            distributorName: req.session.distributorName,
+            countryName: req.session.countryName
+        });
+    } else {
+        res.json({ isLoggedIn: false });
+    }
+});
+// Get all products (Read)
+app.get('/api/products', async (req, res) => {
+    try {
+        const [results] = await db.query('SELECT * FROM Product');
+        res.status(200).json(results);
+    } catch (err) {
+        console.error('Error fetching products:', err);
+        res.status(500).json({ error: 'Database error fetching products' });
+    }
+});
+
+// Add a new product (Create)
+app.post('/api/products', async (req, res) => {
+    const { BrandID, CategoryID, SubCategoryID, ItemCode, PartCode, ProductDescription, Warranty, MOQ } = req.body;
+
+    if (!BrandID || !CategoryID || !SubCategoryID || !ItemCode || !ProductDescription || !MOQ) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    try {
+        const insertQuery = `
+            INSERT INTO Product (BrandID, CategoryID, SubCategoryID, ItemCode, PartCode, ProductDescription, Warranty, MOQ)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+        const [result] = await db.query(insertQuery, [BrandID, CategoryID, SubCategoryID, ItemCode, PartCode, ProductDescription, Warranty, MOQ]);
+        res.status(201).json({ message: 'Product added successfully', productId: result.insertId });
+    } catch (err) {
+        console.error('Error adding product:', err);
+        res.status(500).json({ error: 'Database error adding product' });
+    }
+});
+
+// Update a product (Update)
+app.put('/api/products/:productId', async (req, res) => {
+    const { productId } = req.params;
+    const { BrandID, CategoryID, SubCategoryID, ItemCode, PartCode, ProductDescription, Warranty, MOQ } = req.body;
+
+    if (!BrandID || !CategoryID || !SubCategoryID || !ItemCode || !ProductDescription || !MOQ) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    try {
+        const updateQuery = `
+            UPDATE Product
+            SET BrandID = ?, CategoryID = ?, SubCategoryID = ?, ItemCode = ?, PartCode = ?, ProductDescription = ?, Warranty = ?, MOQ = ?
+            WHERE ProductID = ?
+        `;
+        const [result] = await db.query(updateQuery, [BrandID, CategoryID, SubCategoryID, ItemCode, PartCode, ProductDescription, Warranty, MOQ, productId]);
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Product not found' });
+        }
+        res.status(200).json({ message: 'Product updated successfully' });
+    } catch (err) {
+        console.error('Error updating product:', err);
+        res.status(500).json({ error: 'Database error updating product' });
+    }
+});
+
+// Delete a product (Delete)
+app.delete('/api/products/:productId', async (req, res) => {
+    const { productId } = req.params;
+
+    try {
+        const [result] = await db.query('DELETE FROM Product WHERE ProductID = ?', [productId]);
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Product not found' });
+        }
+        res.status(200).json({ message: 'Product deleted successfully' });
+    } catch (err) {
+        console.error('Error deleting product:', err);
+        res.status(500).json({ error: 'Database error deleting product' });
+    }
+});
+
+// Get all brands
+app.get('/api/brands', async (req, res) => {
+    try {
+        const [results] = await db.query('SELECT * FROM Brand');
+        res.status(200).json(results);
+    } catch (err) {
+        console.error('Error fetching brands:', err);
+        res.status(500).json({ error: 'Database error fetching brands' });
+    }
+});
+
+// Add a new brand
+app.post('/api/brands', async (req, res) => {
+    const { BrandName } = req.body;
+    if (!BrandName) {
+        return res.status(400).json({ error: 'Brand name is required' });
+    }
+
+    try {
+        const [result] = await db.query('INSERT INTO Brand (BrandName) VALUES (?)', [BrandName]);
+        res.status(201).json({ message: 'Brand added successfully', brandId: result.insertId });
+    } catch (err) {
+        console.error('Error adding brand:', err);
+        res.status(500).json({ error: 'Database error adding brand' });
+    }
+});
+
+// Get all categories
+app.get('/api/categories', async (req, res) => {
+    try {
+        const [results] = await db.query('SELECT * FROM Category');
+        res.status(200).json(results);
+    } catch (err) {
+        console.error('Error fetching categories:', err);
+        res.status(500).json({ error: 'Database error fetching categories' });
+    }
+});
+
+// Add a new category
+app.post('/api/categories', async (req, res) => {
+    const { CategoryName } = req.body;
+    if (!CategoryName) {
+        return res.status(400).json({ error: 'Category name is required' });
+    }
+
+    try {
+        const [result] = await db.query('INSERT INTO Category (CategoryName) VALUES (?)', [CategoryName]);
+        res.status(201).json({ message: 'Category added successfully', categoryId: result.insertId });
+    } catch (err) {
+        console.error('Error adding category:', err);
+        res.status(500).json({ error: 'Database error adding category' });
+    }
+});
+
+// Get all subcategories
+app.get('/api/subcategories', async (req, res) => {
+    try {
+        const [results] = await db.query('SELECT * FROM SubCategory');
+        res.status(200).json(results);
+    } catch (err) {
+        console.error('Error fetching subcategories:', err);
+        res.status(500).json({ error: 'Database error fetching subcategories' });
+    }
+});
+
+// Add a new subcategory
+app.post('/api/subcategories', async (req, res) => {
+    const { SubCategoryName, CategoryID } = req.body;
+    if (!SubCategoryName || !CategoryID) {
+        return res.status(400).json({ error: 'Subcategory name and CategoryID are required' });
+    }
+
+    try {
+        const [result] = await db.query('INSERT INTO SubCategory (SubCategoryName, CategoryID) VALUES (?, ?)', [SubCategoryName, CategoryID]);
+        res.status(201).json({ message: 'Subcategory added successfully', subcategoryId: result.insertId });
+    } catch (err) {
+        console.error('Error adding subcategory:', err);
+        res.status(500).json({ error: 'Database error adding subcategory' });
+    }
+});
+
+// Get all countries
+app.get('/api/countries', async (req, res) => {
+    console.log('Received request for countries');
+    try {
+        const [results] = await db.query('SELECT * FROM Country');
+        console.log('Countries fetched successfully:', results);
+        res.status(200).json(results);
+    } catch (err) {
+        console.error('Error fetching countries:', err);
+        res.status(500).json({ error: 'Database error fetching countries' });
+    }
+});
+
+// Get all country-product records
+app.get('/api/country-products', async (req, res) => {
+    try {
+        const [results] = await db.query('SELECT * FROM Country_Product');
+        res.status(200).json(results);
+    } catch (err) {
+        console.error('Error fetching country-product records:', err);
+        res.status(500).json({ error: 'Database error fetching records' });
+    }
+});
+
+// Add a new country-product record
+app.post('/api/country-products', async (req, res) => {
+    const { CountryID, ProductID, Price } = req.body;
+
+    if (!CountryID || !ProductID || !Price) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    try {
+        const [result] = await db.query('INSERT INTO Country_Product (CountryID, ProductID, Price) VALUES (?, ?, ?)', [CountryID, ProductID, Price]);
+        res.status(201).json({ message: 'Country-Product record added successfully', countryProductId: result.insertId });
+    } catch (err) {
+        console.error('Error adding country-product record:', err);
+        res.status(500).json({ error: 'Database error adding record' });
+    }
+});
+
+
+app.get('/api/distributors/:distributorId', (req, res) => {
+    const distributorId = req.params.distributorId;
+
+    const sqlQuery = `
+        SELECT DistributorName, CountryName 
+        FROM Distributor 
+        WHERE DistributorId = ?
+    `;
+
+    db.query(sqlQuery, [distributorId], (err, results) => {
+        if (err) {
+            console.error('Error fetching distributor:', err);
+            return res.status(500).json({ error: 'Failed to fetch distributor' });
+        }
+        if (results.length === 0) {
+            return res.status(404).json({ error: 'Distributor not found' });
+        }
+        res.json(results[0]);
+    });
+});
+
+
+app.get('/api/products-by-country', async (req, res) => {
+    const countryName = req.query.countryName;
+    console.log('Received request for products-by-country');
+    console.log('Query:', req.query);
+
+    if (!countryName) {
+        return res.status(400).json({ error: 'Country name is required' });
+    }
+
+    const sqlQuery = `
+        SELECT 
+            p.ProductID, 
+            p.ItemCode AS ProductCode, 
+            p.ProductDescription AS Description, 
+            p.MOQ AS MinOrderQty, 
+            cp.Price 
+        FROM Product p
+        JOIN Country_Product cp ON p.ProductID = cp.ProductID
+        JOIN Country c ON cp.CountryID = c.CountryID
+        WHERE c.CountryName = ?`;
+
+    try {
+        const [results] = await db.query(sqlQuery, [countryName]);
+        console.log('Query results:', results);
+        res.json(results);
+    } catch (err) {
+        console.error('Error fetching products:', err);
+        return res.status(500).json({ error: 'Failed to fetch products', details: err.message });
+    }
+});
+
+
+// Update the products by country endpoint
+
+
 app.get('/api/consolidated-orders', (req, res) => {
     const query = `
         SELECT 
@@ -143,27 +441,6 @@ app.get('/api/consolidated-orders', (req, res) => {
         res.status(200).json(consolidatedData);
     });
 });
-
-app.post('/api/validate', (req, res) => {
-    const productCodes = req.body.productCodes;
-
-    // Check if all product codes exist in the masterlist
-    const query = 'SELECT product_code FROM masterlist WHERE product_code IN (?)';
-    db.query(query, [productCodes], (err, results) => {
-        if (err) return res.status(500).json({ message: 'Database error' });
-
-        const validCodes = results.map(row => row.product_code);
-        const invalidCodes = productCodes.filter(code => !validCodes.includes(code));
-
-        if (invalidCodes.length > 0) {
-            return res.status(400).json({ message: 'Invalid product codes', invalidCodes });
-        }
-
-        res.status(200).json({ message: 'All product codes are valid' });
-    });
-});
-
-
 
 // Start the server
 app.listen(PORT, () => {
